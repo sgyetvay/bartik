@@ -1,0 +1,467 @@
+---
+title: "Bartik"
+author: "Sam Gyetvay"
+date: "12/10/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = TRUE)
+rm(list=ls())
+library(tidyverse)
+library(tidyquant)
+library(broom)
+library(ggplot2)
+```
+
+
+###Warm Up: 2SLS
+
+The paper has to do with 2SLS, and this is the first time I've worked with R, so I start with a basic exercise: simulating a univariate 2SLS and running a Monte-Carlo on it
+
+\begin{align*}
+y &= \alpha + \beta x + \epsilon \\
+x &= \delta + \gamma z + \zeta
+\end{align*}
+
+Generating the data:
+
+```{r}
+alpha = 1
+beta = 2
+
+simulate_data <- function(N) {
+df <- crossing(location = 1:N) %>%  
+  mutate(epsilon = rnorm(N),
+         instrument = 0.5*rnorm(N),
+         treatment = 1*epsilon + 1*instrument + 0.05*rnorm(N),
+         outcome = alpha + beta*treatment + epsilon)
+return(df)
+}
+
+df <- simulate_data(100)
+head(df)
+```
+
+We need to use IV if $Cov(x,\epsilon) \not= 0$. IV is valid if it is relevant ($Cov(x,z) \not= 0$) and satisfies the *exclusion restriction* $Cov(z,\epsilon) = 0$:
+
+```{r}
+cov(df$treatment, df$epsilon) #need IV
+
+cov(df$treatment, df$instrument) #relevance
+cov(df$instrument, df$epsilon) #exclusion
+```
+
+In this case, OLS is biased but 2SLS is not
+
+```{r}
+#ols
+ols <- function(df) {
+lm(df$outcome ~ df$treatment)$coefficients[2]  
+}
+
+#2sls
+twosls <- function(df) {
+coefficients(lm(df$outcome ~ predict(lm(df$treatment ~ df$instrument))))[2]
+}
+
+cat("The OLS estimate is ", ols(df), " and the 2SLS estimate is ", twosls(df), ".")
+```
+
+To make sure these results were not haphazard, I run a Monte-Carlo simulation. To do this I use the R functions `simulate_data`, `twosls` and `ols` I created above evaluate them $M$ times. I plot the results in a smoothed density plot.
+
+```{r}
+M = 100 #number of monte-carlos
+
+betas <- c()
+method <- c()
+sample_size <- c()
+
+for (n in c(100,1000)) {
+  for (i in seq(M)) {
+    betas <- c(betas, twosls(simulate_data(n)))
+    method <- c(method, "IV")
+    sample_size <- c(sample_size,n)
+  }
+    for (i in seq(M)) {
+    betas <- c(betas, ols(simulate_data(n)))
+    method <- c(method, "OLS")
+    sample_size <- c(sample_size,n)
+  }
+}
+
+
+plotdata <- as.data.frame(betas)
+plotdata$betas_centered <- betas-beta
+plotdata$method <- method
+plotdata$sample_size <- sample_size
+
+ggplot(plotdata, aes(x=betas_centered, color=method, linetype = as.factor(sample_size))) + 
+  scale_linetype_discrete(name="N") +
+  geom_density(alpha=0.33, position="identity", bw=0.1, fill=NA) +
+  xlim(c(-2.5,2.5))
+
+
+```
+
+
+Cool. Now I'm ready to move on to the paper. 
+
+### Borusyak, Hull, Jaravel (2018)
+
+####Some Theory
+
+Start out with a basic cross-sectional shift-share set up. $\ell = 1, ..., L$ indexes locations, $y_\ell$ are outcomes, $x_\ell$ are treatment, $w_\ell$ are vectors of controls, and $\epsilon_\ell$ are residuals. The regression equation is
+
+\[
+y_\ell = \beta x_\ell + w_\ell'\gamma + \epsilon_\ell
+\]
+
+where $E[\epsilon_\ell] = E[w_\ell\epsilon_\ell] = 0$ but $E[x_\ell\epsilon_\ell] \not= 0$. Construct the shift-share instrument $z_\ell$ from industry (indexed by $n = 1, ..., N$) level shocks (shift) $g_n$ and weights (local industry share) $s_{\ell n}$:
+
+\[
+z_\ell = \sum_{n=1}^N s_{\ell n} g_n
+\]
+
+Now do the usual IV stuff. We first regress
+
+\[
+x_\ell = \delta z_\ell + w_\ell'\gamma_1 e_\ell
+\]
+
+Then get $\hat{x}_\ell = \hat{\delta}z_\ell$ and regress
+
+\[
+y_\ell = \beta \hat{x}_\ell + w_\ell'\gamma_2 + \epsilon_\ell
+\]
+
+to get 
+
+\[
+\hat{\beta}_\ell 
+=
+\frac{\frac{1}{L}\sum_\ell z_\ell y_\ell^\perp}{\frac{1}{L}\sum_\ell z_\ell x_\ell^\perp}
+\]
+
+where $x_\ell^\perp = x_\ell - \hat{x}_\ell$ and $y_\ell^\perp = y_\ell - \hat{y}_\ell$. This is the typical way to do shift-share; a regression at the location level. The core insight of BHJ is that this is equivalent to doing 2SLS procedure at the industry level. Watch this:
+
+\begin{align*}
+\hat{\beta}_\ell 
+&= 
+\frac{\frac{1}{L}\sum_\ell z_\ell y_\ell^\perp}{\frac{1}{L}\sum_\ell z_\ell x_\ell^\perp} \\
+&=
+\frac{\frac{1}{L}\sum_\ell \big(\sum_n s_{\ell n} g_n\big) y_\ell^\perp}{\frac{1}{L}\sum_\ell \big(\sum_n s_{\ell n} g_n\big) x_\ell^\perp} \\
+&=
+\frac{\sum_n g_n \big(\frac{1}{L}\sum_\ell s_{\ell n} y_\ell^\perp \big) }{\sum_n g_n \big(\frac{1}{L}\sum_\ell s_{\ell n} x_\ell^\perp \big) } \\
+&=
+\frac{\sum_n g_n \big(\frac{1}{L}\sum_\ell s_{\ell n} \big) \big[\big(\frac{1}{L}\sum_\ell s_{\ell n} y_\ell^\perp\big)/\big( \frac{1}{L}\sum_\ell s_{\ell n}\big)\big]}{\sum_n g_n \big(\frac{1}{L}\sum_\ell s_{\ell n} \big) \big[\big(\frac{1}{L}\sum_\ell s_{\ell n} x_\ell^\perp\big)/\big( \frac{1}{L}\sum_\ell s_{\ell n}\big)\big]} \\
+&=
+\frac{\sum_n g_n \hat{s}_n\bar{y}_n^\perp}{\sum_n g_n\hat{s}_n \bar{x}_n^\perp}
+=
+\hat{\beta}_n
+\end{align*}
+
+where $\hat{s}_n$ is average exposure to industry $n$, and $\bar{x}_n$, $\bar{y}_n$ are weighted averages of $x_\ell$, $y_\ell$ where larger weights are given to industries with more exposure. So we can get $\hat{\beta}_n$ from $\hat{s}_n$-weighted 2SLS of with instrument $g_n$ and second stage
+
+\[
+\bar{y}^\perp_n = \alpha + \beta\bar{x}_n^\perp + \bar{\epsilon}^\perp_n
+\]
+
+
+####A Simulation to show Numerical Equivalence
+
+I'll now simulate a cross-sectional Bartik data-set similar to one that an applied researcher would have, and illustrate the numerical equivalence betwen $\hat{\beta}_\ell$ and $\hat{\beta}_n$. 
+
+
+```{r}
+
+L = 50 #number of locations
+N = 100 #number of industries
+
+alpha = 1 #intercept
+beta = 2 #coefficient of interest
+gamma = 3 #controls
+
+df <- crossing(location = 1:L,
+               industry = 1:N) %>%
+  group_by(location) %>% 
+  mutate(control = rnorm(1),
+         error = runif(1),
+         treatment = 0.5*error + runif(1),
+         outcome = alpha + beta*treatment + gamma*control + error) %>%  
+  group_by(industry) %>% 
+  mutate(shock = 1.5*rnorm(1),
+         share = runif(L)) %>%
+  group_by(location) %>% 
+  mutate(share = share/sum(share))
+
+
+df %>% arrange(location) %>%  head()
+```
+
+I simulated data in this "long" form (with $L*N$ rows) because it seems like that's the way a researcher would get it in, and it's easy to calculate both the standard shift-share, and the industry-level shiftware with data in this form. It's also conceivable that data could come in "wide" form ($L$ rows, with industry-level variables as columns) but I won't deal with that case.
+
+Now I'll collapse this into a dataframe `dfL` with $L$ rows and create the instrument $z_\ell$:
+
+```{r}
+dfL <- df %>% 
+mutate(shiftshare = share*shock) %>% 
+  group_by(location) %>% 
+mutate(shiftshare = sum(shiftshare)) %>% 
+summarise(outcome = mean(outcome),
+          control = mean(control),
+          treatment = mean(treatment),
+          shiftshare = mean(shiftshare))
+
+dfL %>%  arrange(location) %>% head()
+```
+
+Then run 2SLS to get $\hat{\beta}_\ell$:
+
+```{r}
+#first stage
+dfL$treatment_hat <- predict(lm(dfL$treatment ~ dfL$shiftshare + dfL$control))
+
+#second stage
+location_reg <- lm(dfL$outcome ~  dfL$treatment_hat + dfL$control)
+```
+
+Now collapse `df` into a dataframe `dfN` with $N$ rows:
+
+```{r}
+
+dfL$treatment_perp <- dfL$treatment - predict(lm(dfL$treatment ~ dfL$control))
+dfL$outcome_perp <- dfL$outcome - predict(lm(dfL$outcome ~ dfL$control))
+
+df <- merge(df,select(dfL,location,outcome_perp,treatment_perp))
+
+dfN <- df %>% 
+  group_by(industry) %>% 
+mutate(industry_share = mean(share)) %>% 
+  group_by(location) %>% 
+  mutate(outcome_ind = outcome_perp*share/(industry_share),
+         treatment_ind = treatment_perp*share/(industry_share)) %>% 
+  group_by(industry) %>% 
+  summarise(outcome = mean(outcome_ind),
+            treatment = mean(treatment_ind),
+            shock = mean(shock),
+            wght = mean(industry_share))
+
+dfN %>%  arrange(industry) %>% head()
+
+```
+
+and run 2SLS to get $\hat{\beta}_n$:
+
+```{r}
+#first stage
+dfN$treatment_hat <- predict(lm(dfN$treatment ~ dfN$shock, weights = dfN$wght))
+
+#second stage
+industry_reg <- lm(dfN$outcome ~ dfN$treatment_hat, weights = dfN$wght)
+
+cat("The estimate from the location-level regression is ", location_reg$coefficients[2], "and the estimate from the industry-level regression is ", industry_reg$coefficients[2])
+```
+
+This shows the numerical equivalence.
+
+####More Theory
+
+The numerical equivalence is interesting because it gives us a new sufficient condition for identification using Bartik instruments: validity of industry-level shocks $g_n$, the instrument in the industry-level data. Such an assumption is natural in many settings, such as in Autor, Dorn \& Hansen (2013) where $g_n$ is constructed from industry-level Chinese import penetratation to non-US countries.
+
+In this section I give a formal statement of BHJ's "shock exogeneity" condition, which they show is equivalent to validity of $z_\ell$. In the next section I do some Monte Carlo simulations to show what happens when we violate shock exogeneity.
+
+The shift-share $z_\ell$ is valid if $E[z_\ell\epsilon_\ell]=0$. Now do some arithmetic similar to above when we showed $\hat{\beta}_\ell = \hat{\beta}_n$:
+
+\[
+E[z_\ell\epsilon_\ell] 
+=
+E\Big[ \sum_n s_{\ell n}g_n \epsilon_\ell \Big] 
+=
+\sum_n \underbrace{E[s_{\ell n}]}_{s_n}g_n\underbrace{E[s_{\ell n}\epsilon_\ell]/E[s_{\ell n}]}_{\phi_n}
+=
+\sum_n s_n g_n \phi_n 
+\]
+where $s_n$ and $\phi_n$ are the population-analogues of $\hat{s}_n$ and $\bar{\epsilon}_n^\perp$. Assuming a LLN holds, BHJ's "shock orthogonality" condition is
+\[
+\sum_n s_ng_n\phi_n \rightarrow 0
+\]
+
+BHJ show that shock orthogonality is satisfied under the following assumptions
+
+- **A1** $E[g_n|\phi_n] = \mu$
+- **A2** $E[(g_n - \mu)(g_m - \mu)|\phi_n,\phi_m] = 0$ for $m \not= n$
+- **A3** $\sum_n s_n^2 \rightarrow 0$
+- **A4** $E[\phi_n^4]$, $E[(g_n - \mu)^4] < \infty$.
+
+In words, A1 states that every industry faces the same expected shock $\mu$ regardless of its $\phi_n$ (they are "as-good-as-randomly assigned.") Suppose the $s_n$ are non-random. In the proof, you use A1 to show 
+
+\[
+E[\sum_n g_n s_n \phi_n] = \sum E[E[g_n|\phi_n] s_n \phi_n] = \mu E[s_n\phi_n] = E[\epsilon_\ell]\mu = 0
+\]
+
+BHJ then show $Var[\sum_n g_n s_n \phi_n] \rightarrow 0$. To do this they use A2 (which says that shocks are mutually uncorrelated given unobservables), A3 (which says that shock exposure is not too concentrated among a small set of industries) and A4 is just there so that they can use the Cauchy-Schwarz inequality.
+
+I'll now do a Monte-Carlo simulation where I relax some of these assumptions and show that $\hat{\beta}_n$ no longer converges to true $\beta$. To do this, I'm going to generate data in a different way than I did above. I will create $\epsilon_\ell$, $s_{\ell n}$ at the local level, but I'm going to "cheat" and skip straight to generating $y_n$ and $x_n$ at the industry level. I'm doing this because it's not obvious (to me) how to construct local-level $x_\ell$, $\epsilon_\ell$ that violate exclusion restrictions with industry-level $g_n$. However, in my defence, this confusion reinforces the point of the paper: Bartik exclusion restrictions are non-intuitive at the local level. I'm also going to exclude controls $w_\ell$ for simplicity.
+
+First, create data where **A1-A4** are all satisfied and very that the IV is consistent: 
+
+```{r, eval = TRUE}
+rm(list = ls())
+
+L = 25
+N = 1000
+alpha = 1
+beta = 2
+
+#create theta_n, s_n
+
+
+df <- crossing(location = 1:L,
+               industry = 1:N) %>% 
+  group_by(location) %>% 
+  mutate(share = runif(N),
+         error = 10*rnorm(N),
+         share = share/sum(share),
+         theta = share*error/sum(share)) %>%
+  group_by(industry) %>% 
+  summarise(theta = sum(theta),
+            share = sum(share))
+
+dfN <- df %>% 
+  mutate(shock = rnorm(N),
+         treatment = 1*shock + 2*theta + 0.5*rnorm(N),
+         outcome = alpha + beta*treatment + 5*theta)
+
+beta <- coefficients(lm(dfN$outcome ~ predict(lm(dfN$treatment ~ dfN$shock))))[2]
+
+cat("The estimate of beta when assumptions A1-A4 hold is ", beta, "which is close to its true value of 2.")
+
+```
+
+Now weaken A2 and make the shocks auto-correlated across industries:
+
+```{r, eval = TRUE}
+dfN <- df %>% 
+  mutate(theta_lag = lag(theta),
+         shock = 0.5*theta + 0.5*theta_lag + rnorm(N),
+         treatment = 1*shock + 2*theta + 0.5*rnorm(N),
+         outcome = alpha + beta*treatment + 5*theta)
+
+dfN <- na.omit(dfN)
+
+beta <- coefficients(lm(dfN$outcome ~ predict(lm(dfN$treatment ~ dfN$shock))))[2]
+
+cat("The estimate of beta when assumptions A2 fails because shocks are auto-correlated across industries is ", beta, "which is far from its true value of 2.")
+```
+
+Now weaken A3 and make the shocks concentrated in a small number of industries:
+
+```{r, eval = TRUE}
+
+df <- crossing(location = 1:L,
+               industry = 1:N) %>% 
+  group_by(location) %>% 
+  mutate(share = runif(N) + ifelse(industry <= 5, 10,0),
+         error = 10*rnorm(N),
+         share = share/sum(share),
+         theta = share*error/sum(share)) %>%
+  group_by(industry) %>% 
+  summarise(theta = sum(theta),
+            share = sum(share))
+
+dfN <- df %>% 
+  mutate(shock = rnorm(N),
+         treatment = 1*shock + 2*theta + 0.5*rnorm(N),
+         outcome = alpha + beta*treatment + 5*theta)
+
+beta <- coefficients(lm(dfN$outcome ~ predict(lm(dfN$treatment ~ dfN$shock))))[2]
+
+cat("The estimate of beta when assumptions A3 fails because shocks are concentrated in a small number of industries is ", beta, "which is far from its true value of 2.")
+
+```
+
+The theorem BHJ prove says that $\hat{\beta}_n$ is *consistent* under A1-A4. Since running a similation with $N = \infty$ wouldn't be finished before the due-date of this assignment, I'll instead run a monte-carlo and show that we don't get convergence doesn't happen as I boost $N$. Note that to violate A3 as I increase $N$ I also need to increase the number of concentrated industries.
+
+Define functions to generate bad data:
+
+```{r}
+rm(list=ls())
+
+alpha = 1
+beta = 2
+
+M = 100 # number of montecarlos
+L = 50 # number of locations
+
+autocorr_shocks <- function(N) {
+  df <- crossing(location = 1:L,
+               industry = 1:N) %>% 
+  group_by(location) %>% 
+  mutate(share = runif(N),
+         error = 10*rnorm(N),
+         share = share/sum(share),
+         theta = share*error/sum(share)) %>%
+  group_by(industry) %>% 
+  summarise(theta = sum(theta),
+            share = sum(share))
+dfN <- df %>% 
+  mutate(shock = rnorm(N),
+         treatment = 1*shock + 2*theta + 0.5*rnorm(N),
+         outcome = alpha + beta*treatment + 5*theta)
+return(dfN)
+}
+
+concentrated_shocks <- function(N) {
+df <- crossing(location = 1:L,
+               industry = 1:N) %>% 
+  group_by(location) %>% 
+  mutate(share = runif(N) + ifelse(industry <= N/20, 10,0),
+         error = 10*rnorm(N),
+         share = share/sum(share),
+         theta = share*error/sum(share)) %>%
+  group_by(industry) %>% 
+  summarise(theta = sum(theta),
+            share = sum(share))
+dfN <- df %>% 
+  mutate(shock = rnorm(N),
+         treatment = 1*shock + 2*theta + 0.5*rnorm(N),
+         outcome = alpha + beta*treatment + 5*theta)
+return(dfN)
+}
+
+twosls <- function(df) {
+coefficients(lm(df$outcome ~ predict(lm(df$treatment ~ df$shock))))[2]
+}
+
+
+betas <- c()
+assumption <- c()
+sample_size <- c()
+
+for (n in c(100,1000)) {
+  for (i in seq(M)) {
+    betas <- c(betas, twosls(autocorr_shocks(n)))
+    assumption <- c("A2", assumption)
+    sample_size <- c(sample_size, n)
+  }
+  for (i in seq(M)) {
+    betas <- c(betas, twosls(concentrated_shocks(n)))
+    assumption <- c("A3", assumption)
+    sample_size <- c(sample_size, n)
+  }
+}
+
+plotdata <- as.data.frame(betas)
+plotdata$betas_centered <- betas-beta
+plotdata$assumption <- assumption
+plotdata$sample_size <- sample_size
+
+ggplot(plotdata, aes(x=betas_centered, color=assumption, linetype = as.factor(sample_size))) + 
+  scale_linetype_discrete(name="N") +
+  geom_density(alpha=0.33, position="identity", bw=0.1, fill=NA) +
+  xlim(c(-2.5,2.5))
+
+```
+
+Looks like both actually *did* converge once I put $N=1000$, despite the assumptions being wrong. I suppose this means the assumptions in BHJ's proof can be weakened.
